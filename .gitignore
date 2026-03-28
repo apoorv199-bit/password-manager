@@ -10,13 +10,14 @@ secrets/
 keys/
 
 # Database / local storage
+vault.json
+vault.enc
+vault.db
+data/
+storage/
 *.db
 *.sqlite
 *.sqlite3
-data/
-storage/
-vault/
-vaults/
 
 # Build files
 bin/
