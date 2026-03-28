@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.*
+
+# Secrets / keys
+*.key
+*.pem
+*.crt
+secrets/
+keys/
+
+# Database / local storage
+*.db
+*.sqlite
+*.sqlite3
+data/
+storage/
+vault/
+vaults/
+
+# Build files
+bin/
+dist/
+build/
+tmp/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Go
+coverage.out
+*.test
+vendor/
