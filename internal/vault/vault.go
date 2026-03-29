@@ -6,6 +6,7 @@ import (
 	"os"
 	"password-manager-cli/internal/crypto"
 	"password-manager-cli/internal/models"
+	"strings"
 	"time"
 )
 
@@ -124,9 +125,9 @@ func AddItem(vault *models.Vault, site, username, password, notes string) {
 	vault.Items = append(vault.Items, item)
 }
 
-func FindItemsBySite(vault models.Vault, site string) *models.VaultItem {
+func FindItemsBySite(vault *models.Vault, site string) *models.VaultItem {
 	for i := range vault.Items {
-		if vault.Items[i].Site == site {
+		if strings.EqualFold(vault.Items[i].Site, site) {
 			return &vault.Items[i]
 		}
 	}
@@ -135,6 +136,72 @@ func FindItemsBySite(vault models.Vault, site string) *models.VaultItem {
 
 func ListItems(vault *models.Vault) []models.VaultItem {
 	return vault.Items
+}
+
+func DeleteItem(vault *models.Vault, site string) bool {
+	for i := range vault.Items {
+		if strings.EqualFold(vault.Items[i].Site, site) {
+			vault.Items = append(vault.Items[:i], vault.Items[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func UpdateItem(vault *models.Vault, site, username, password, notes string) bool {
+	for i := range vault.Items {
+		if strings.EqualFold(vault.Items[i].Site, site) {
+			vault.Items[i].Username = username
+			vault.Items[i].Password = password
+			vault.Items[i].Notes = notes
+			vault.Items[i].UpdatedAt = time.Now().Format(time.RFC3339)
+			return true
+		}
+	}
+	return false
+}
+
+func SearchItems(vault *models.Vault, query string) []models.VaultItem {
+	query = strings.ToLower(query)
+	var results []models.VaultItem
+
+	for _, item := range vault.Items {
+		if strings.Contains(strings.ToLower(item.Site), query) || strings.Contains(strings.ToLower(item.Username), query) {
+			results = append(results, item)
+		}
+	}
+	return results
+}
+
+func ChangeMasterPassword(filePath string, vault *models.Vault, newPassword string) error {
+	newSalt, err := crypto.GeneraterandomBytes(crypto.SaltSize)
+	if err != nil {
+		return err
+	}
+
+	newKey := crypto.DeriveKey(newPassword, newSalt, DefaultKDFMemory, DefaultKDFIterations, DefaultKDFParallelism)
+
+	plaintext, err := json.Marshal(vault)
+	if err != nil {
+		return err
+	}
+
+	nonce, ciphertext, err := crypto.Encrypt(newKey, plaintext)
+	if err != nil {
+		return err
+	}
+
+	vaultFile := models.VaultFile{
+		Version:           1,
+		KDFSalt:           crypto.EncodeB64(newSalt),
+		KDFMemory:         DefaultKDFMemory,
+		KDFIterations:     DefaultKDFIterations,
+		KDFParallelism:    DefaultKDFParallelism,
+		EncryptionNonce:   crypto.EncodeB64(nonce),
+		EncryptedValutB64: crypto.EncodeB64(ciphertext),
+	}
+
+	return writeVaultFile(filePath, vaultFile)
 }
 
 func generateID() string {
