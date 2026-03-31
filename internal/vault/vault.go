@@ -22,97 +22,278 @@ func InitVault(filePath string, masterPassword string) error {
 		return errors.New("vault already exists")
 	}
 
+	// Generate salt for Argon2id
 	salt, err := crypto.GeneraterandomBytes(crypto.SaltSize)
 	if err != nil {
 		return err
 	}
 
-	key := crypto.DeriveKey(masterPassword, salt, DefaultKDFMemory, DefaultKDFIterations, DefaultKDFParallelism)
+	// Derive Master Unlock Key (MUK - master unlock key)
+	muk := crypto.DeriveKey(masterPassword, salt, DefaultKDFMemory, DefaultKDFIterations, DefaultKDFParallelism)
 
-	emptyVault := models.Vault{
-		Items: []models.VaultItem{},
-	}
-
-	plaintext, err := json.Marshal(emptyVault)
+	// Generate Random Vault Key
+	vaultKey, err := crypto.GeneraterandomBytes(32)
 	if err != nil {
 		return err
 	}
 
-	nonce, ciphertext, err := crypto.Encrypt(key, plaintext)
+	// Wrap (encrypt) Vault Key using MUK
+	nonce, wrappedVK, err := crypto.Encrypt(muk, vaultKey)
 	if err != nil {
 		return err
 	}
 
 	vaultFile := models.VaultFile{
-		Version:           1,
-		KDFSalt:           crypto.EncodeB64(salt),
-		KDFMemory:         DefaultKDFMemory,
-		KDFIterations:     DefaultKDFIterations,
-		KDFParallelism:    DefaultKDFParallelism,
-		EncryptionNonce:   crypto.EncodeB64(nonce),
-		EncryptedValutB64: crypto.EncodeB64(ciphertext),
+		Version: 2,
+		KDF: models.KDFParams{
+			Salt:        crypto.EncodeB64(salt),
+			Memory:      DefaultKDFMemory,
+			Iterations:  DefaultKDFIterations,
+			Parallelism: DefaultKDFParallelism,
+		},
+		WrappedVaultKey: crypto.EncodeB64(wrappedVK),
+		VaultKeyNonce:   crypto.EncodeB64(nonce),
+		Items:           []models.EncryptedItem{},
 	}
 
 	return writeVaultFile(filePath, vaultFile)
 }
 
-func LoadVault(filepath string, masterPassword string) (*models.Vault, *models.VaultFile, []byte, error) {
-	vaultFile, err := readVaultFile(filepath)
+// UnlockVault unlocks the vault by:
+// - deriving MUK from password
+// - decrypting wrapped Vault Key
+func UnlockVault(filePath, password string) ([]byte, *models.VaultFile, error) {
+	vf, err := readVaultFile(filePath)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	salt, err := crypto.DecodeB64(vaultFile.KDFSalt)
+	salt, err := crypto.DecodeB64(vf.KDF.Salt)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	nonce, err := crypto.DecodeB64(vaultFile.EncryptionNonce)
+	muk := crypto.DeriveKey(password, salt, vf.KDF.Memory, vf.KDF.Iterations, vf.KDF.Parallelism)
+
+	nonce, err := crypto.DecodeB64(vf.VaultKeyNonce)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	ciphertext, err := crypto.DecodeB64(vaultFile.EncryptedValutB64)
+	wrappedVK, err := crypto.DecodeB64(vf.WrappedVaultKey)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	key := crypto.DeriveKey(masterPassword, salt, DefaultKDFMemory, DefaultKDFIterations, DefaultKDFParallelism)
-
-	plaintext, err := crypto.Decrypt(key, nonce, ciphertext)
+	vaultKey, err := crypto.Decrypt(muk, nonce, wrappedVK)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	var vault models.Vault
-	if err := json.Unmarshal(plaintext, &vault); err != nil {
-		return nil, nil, nil, err
-	}
-
-	return &vault, vaultFile, key, nil
+	return vaultKey, vf, nil
 }
 
-func SaveVault(filePath string, vault *models.Vault, vaultFile *models.VaultFile, key []byte) error {
-	plaintext, err := json.Marshal(vault)
+// SaveVault persists the current vault file to disk.
+func SaveVault(filePath string, vf *models.VaultFile) error {
+	return writeVaultFile(filePath, *vf)
+}
+
+// ChangeMasterPassword changes the master password by:
+// - unlocking current Vault Key using old password
+// - deriving a new MUK from new password
+// - re-wrapping the same Vault Key
+func ChangeMasterPassword(filePath string, oldPassword, newPassword string) error {
+	vaultKey, vf, err := UnlockVault(filePath, oldPassword)
 	if err != nil {
 		return err
 	}
 
-	nonce, ciphertext, err := crypto.Encrypt(key, plaintext)
+	newSalt, err := crypto.GeneraterandomBytes(crypto.SaltSize)
 	if err != nil {
 		return err
 	}
 
-	vaultFile.EncryptionNonce = crypto.EncodeB64(nonce)
-	vaultFile.EncryptedValutB64 = crypto.EncodeB64(ciphertext)
+	newMUK := crypto.DeriveKey(newPassword, newSalt, DefaultKDFMemory, DefaultKDFIterations, DefaultKDFParallelism)
 
-	return writeVaultFile(filePath, *vaultFile)
+	newNonce, newWrappedVK, err := crypto.Encrypt(newMUK, vaultKey)
+	if err != nil {
+		return err
+	}
+
+	vf.KDF.Salt = crypto.EncodeB64(newSalt)
+	vf.WrappedVaultKey = crypto.EncodeB64(newWrappedVK)
+	vf.VaultKeyNonce = crypto.EncodeB64(newNonce)
+
+	return writeVaultFile(filePath, *vf)
 }
 
-func AddItem(vault *models.Vault, site, username, password, notes string) {
+// EncryptItem encrypts a plaintext VaultItem into an EncryptedItem using Vault Key.
+func EncryptItem(item models.VaultItem, vaultKey []byte) (*models.EncryptedItem, error) {
+	plaintext, err := json.Marshal(item)
+	if err != nil {
+		return nil, err
+	}
+
+	nonce, ciphertext, err := crypto.Encrypt(vaultKey, plaintext)
+	if err != nil {
+		return nil, err
+	}
+
+	return &models.EncryptedItem{
+		ID:         item.ID,
+		Site:       item.Site,
+		Nonce:      crypto.EncodeB64(nonce),
+		Ciphertext: crypto.EncodeB64(ciphertext),
+	}, nil
+}
+
+// DecryptItem decrypts one EncryptedItem into its plaintext VaultItem.
+func DecryptItem(enc models.EncryptedItem, vaultKey []byte) (*models.VaultItem, error) {
+	nonce, err := crypto.DecodeB64(enc.Nonce)
+	if err != nil {
+		return nil, err
+	}
+
+	ciphertext, err := crypto.DecodeB64(enc.Ciphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	plaintext, err := crypto.Decrypt(vaultKey, nonce, ciphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	var vaultItem models.VaultItem
+	if err := json.Unmarshal(plaintext, &vaultItem); err != nil {
+		return nil, err
+	}
+
+	return &vaultItem, nil
+}
+
+// DecryptAllItems decrypts all vault items.
+func DecryptAllItems(vf *models.VaultFile, vaultKey []byte) ([]models.VaultItem, error) {
+	var items []models.VaultItem
+
+	for _, encItem := range vf.Items {
+		item, err := DecryptItem(encItem, vaultKey)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, *item)
+	}
+	return items, nil
+}
+
+// AddItem adds a new encrypted item to the vault.
+func AddItem(vf *models.VaultFile, vaultKey []byte, item models.VaultItem) error {
+	encItem, err := EncryptItem(item, vaultKey)
+	if err != nil {
+		return err
+	}
+
+	vf.Items = append(vf.Items, *encItem)
+	return nil
+}
+
+// ListItems returns encrypted items (metadata visible, secrets still encrypted).
+// Useful for showing site list without decrypting secrets.
+func ListItems(vf *models.VaultFile) []models.EncryptedItem {
+	return vf.Items
+}
+
+// SearchItems searches by plaintext metadata only (currently site).
+func SearchItems(vf *models.VaultFile, query string) []models.EncryptedItem {
+	query = strings.ToLower(query)
+	var results []models.EncryptedItem
+
+	for _, item := range vf.Items {
+		if strings.Contains(strings.ToLower(item.Site), query) {
+			results = append(results, item)
+		}
+	}
+	return results
+}
+
+// FindEncryptedItemByID returns the encrypted record by ID.
+func FindEncryptedItemByID(vf *models.VaultFile, id string) *models.EncryptedItem {
+	for i := range vf.Items {
+		if vf.Items[i].ID == id {
+			return &vf.Items[i]
+		}
+	}
+	return nil
+}
+
+// FindEncryptedItemsBySite returns all encrypted items for a site.
+func FindEncryptedItemsBySite(vf *models.VaultFile, site string) []models.EncryptedItem {
+	var results []models.EncryptedItem
+	for _, item := range vf.Items {
+		if strings.EqualFold(item.Site, site) {
+			results = append(results, item)
+		}
+	}
+	return results
+}
+
+// GetFullItemByID returns the fully decrypted VaultItem by ID.
+func GetFullItemByID(vf *models.VaultFile, vaultKey []byte, id string) (*models.VaultItem, error) {
+	for _, item := range vf.Items {
+		if item.ID == id {
+			return DecryptItem(item, vaultKey)
+		}
+	}
+	return nil, nil
+}
+
+// UpdateItemByID updates one item by:
+// - locating encrypted record
+// - decrypting only that item
+// - modifying plaintext
+// - re-encrypting only that item
+func UpdateItemByID(vf *models.VaultFile, vaultKey []byte, id, username, password, notes string) (bool, error) {
+	for i := range vf.Items {
+		if vf.Items[i].ID == id {
+			vaultItem, err := DecryptItem(vf.Items[i], vaultKey)
+			if err != nil {
+				return false, err
+			}
+
+			vaultItem.Username = username
+			vaultItem.Password = password
+			vaultItem.Notes = notes
+			vaultItem.UpdatedAt = time.Now().Format(time.RFC3339)
+
+			updatedEnc, err := EncryptItem(*vaultItem, vaultKey)
+			if err != nil {
+				return false, err
+			}
+
+			vf.Items[i] = *updatedEnc
+
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// DeleteItemByID deletes an item by ID without needing decryption.
+func DeleteItemByID(vf *models.VaultFile, id string) bool {
+	for i := range vf.Items {
+		if vf.Items[i].ID == id {
+			vf.Items = append(vf.Items[:i], vf.Items[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// GenerateItem creates a new VaultItem with timestamps and ID.
+func GenerateItem(site, username, password, notes string) models.VaultItem {
 	now := time.Now().Format(time.RFC3339)
 
-	item := models.VaultItem{
+	return models.VaultItem{
 		ID:        generateID(),
 		Site:      site,
 		Username:  username,
@@ -121,87 +302,6 @@ func AddItem(vault *models.Vault, site, username, password, notes string) {
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-
-	vault.Items = append(vault.Items, item)
-}
-
-func FindItemsBySite(vault *models.Vault, site string) *models.VaultItem {
-	for i := range vault.Items {
-		if strings.EqualFold(vault.Items[i].Site, site) {
-			return &vault.Items[i]
-		}
-	}
-	return nil
-}
-
-func ListItems(vault *models.Vault) []models.VaultItem {
-	return vault.Items
-}
-
-func DeleteItem(vault *models.Vault, site string) bool {
-	for i := range vault.Items {
-		if strings.EqualFold(vault.Items[i].Site, site) {
-			vault.Items = append(vault.Items[:i], vault.Items[i+1:]...)
-			return true
-		}
-	}
-	return false
-}
-
-func UpdateItem(vault *models.Vault, site, username, password, notes string) bool {
-	for i := range vault.Items {
-		if strings.EqualFold(vault.Items[i].Site, site) {
-			vault.Items[i].Username = username
-			vault.Items[i].Password = password
-			vault.Items[i].Notes = notes
-			vault.Items[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			return true
-		}
-	}
-	return false
-}
-
-func SearchItems(vault *models.Vault, query string) []models.VaultItem {
-	query = strings.ToLower(query)
-	var results []models.VaultItem
-
-	for _, item := range vault.Items {
-		if strings.Contains(strings.ToLower(item.Site), query) || strings.Contains(strings.ToLower(item.Username), query) {
-			results = append(results, item)
-		}
-	}
-	return results
-}
-
-func ChangeMasterPassword(filePath string, vault *models.Vault, newPassword string) error {
-	newSalt, err := crypto.GeneraterandomBytes(crypto.SaltSize)
-	if err != nil {
-		return err
-	}
-
-	newKey := crypto.DeriveKey(newPassword, newSalt, DefaultKDFMemory, DefaultKDFIterations, DefaultKDFParallelism)
-
-	plaintext, err := json.Marshal(vault)
-	if err != nil {
-		return err
-	}
-
-	nonce, ciphertext, err := crypto.Encrypt(newKey, plaintext)
-	if err != nil {
-		return err
-	}
-
-	vaultFile := models.VaultFile{
-		Version:           1,
-		KDFSalt:           crypto.EncodeB64(newSalt),
-		KDFMemory:         DefaultKDFMemory,
-		KDFIterations:     DefaultKDFIterations,
-		KDFParallelism:    DefaultKDFParallelism,
-		EncryptionNonce:   crypto.EncodeB64(nonce),
-		EncryptedValutB64: crypto.EncodeB64(ciphertext),
-	}
-
-	return writeVaultFile(filePath, vaultFile)
 }
 
 func generateID() string {
