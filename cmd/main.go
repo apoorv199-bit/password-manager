@@ -50,6 +50,11 @@ func handleInit() {
 		return
 	}
 
+	if err := utils.ValidateMasterPassword(password); err != nil {
+		fmt.Println("Weak master password:", err)
+		return
+	}
+
 	confirm, err := utils.PromptPassword("Confirm master password: ")
 	if err != nil {
 		fmt.Println("Error:", err)
@@ -77,7 +82,7 @@ func handleAdd() {
 		return
 	}
 
-	v, vf, key, err := vault.LoadVault(vaultPath, password)
+	vaultKey, vf, err := vault.UnlockVault(vaultPath, password)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
@@ -85,12 +90,27 @@ func handleAdd() {
 
 	site, _ := utils.Prompt("Site: ")
 	username, _ := utils.Prompt("Username: ")
-	pass, _ := utils.Prompt("Password: ")
+
+	pass, _ := utils.Prompt("Password (leave blank to auto-generate): ")
+	if pass == "" {
+		pass, err = utils.GeneratePassword(12)
+		if err != nil {
+			fmt.Println("Error generating password:", err)
+			return
+		}
+		fmt.Println("Generated Password:", pass)
+	}
+
 	notes, _ := utils.Prompt("Notes: ")
 
-	vault.AddItem(v, site, username, pass, notes)
+	item := vault.GenerateItem(site, username, pass, notes)
 
-	if err := vault.SaveVault(vaultPath, v, vf, key); err != nil {
+	if err = vault.AddItem(vf, vaultKey, item); err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	if err := vault.SaveVault(vaultPath, vf); err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
@@ -105,13 +125,13 @@ func handleList() {
 		return
 	}
 
-	v, _, _, err := vault.LoadVault(vaultPath, password)
+	vaultKey, vf, err := vault.UnlockVault(vaultPath, password)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 
-	items := vault.ListItems(v)
+	items := vault.ListItems(vf)
 	if len(items) == 0 {
 		fmt.Println("Vault is empty")
 		return
@@ -119,7 +139,13 @@ func handleList() {
 
 	fmt.Println("\nStored Credentials:")
 	for i, item := range items {
-		fmt.Printf("%d. %s (%s)\n", i+1, item.Site, item.Username)
+		fullItem, err := vault.DecryptItem(item, vaultKey)
+		if err != nil {
+			fmt.Printf("%d. [%s] %s (error decrypting)\n", i+1, item.ID, item.Site)
+			continue
+		}
+
+		fmt.Printf("%d. [%s] %s (%s)\n", i+1, item.ID, item.Site, fullItem.Username)
 	}
 }
 
@@ -130,14 +156,19 @@ func handleGet() {
 		return
 	}
 
-	v, _, _, err := vault.LoadVault(vaultPath, password)
+	vaultKey, vf, err := vault.UnlockVault(vaultPath, password)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 
-	site, _ := utils.Prompt("Enter site: ")
-	item := vault.FindItemsBySite(v, site)
+	id, _ := utils.Prompt("Enter credential ID: ")
+	item, err := vault.GetFullItemByID(vf, vaultKey, id)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
 	if item == nil {
 		fmt.Println("No credential found")
 		return
@@ -159,14 +190,14 @@ func handleSearch() {
 		return
 	}
 
-	v, _, _, err := vault.LoadVault(vaultPath, password)
+	vaultKey, vf, err := vault.UnlockVault(vaultPath, password)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 
 	query, _ := utils.Prompt("Search query: ")
-	results := vault.SearchItems(v, query)
+	results := vault.SearchItems(vf, query)
 
 	if len(results) == 0 {
 		fmt.Println("No matching credentials found")
@@ -175,7 +206,13 @@ func handleSearch() {
 
 	fmt.Println("\nSearch Results:")
 	for i, item := range results {
-		fmt.Printf("%d. %s (%s)\n", i+1, item.Site, item.Username)
+		fullItem, err := vault.DecryptItem(item, vaultKey)
+		if err != nil {
+			fmt.Printf("%d. [%s] %s (error decrypting)\n", i+1, item.ID, item.Site)
+			continue
+		}
+
+		fmt.Printf("%d. [%s] %s (%s)\n", i+1, item.ID, item.Site, fullItem.Username)
 	}
 }
 
@@ -186,29 +223,52 @@ func handleUpdate() {
 		return
 	}
 
-	v, vf, key, err := vault.LoadVault(vaultPath, password)
+	vaultKey, vf, err := vault.UnlockVault(vaultPath, password)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 
-	site, _ := utils.Prompt("Enter site to update: ")
-	item := vault.FindItemsBySite(v, site)
-	if item == nil {
+	id, _ := utils.Prompt("Enter credential ID to update: ")
+
+	existing, err := vault.GetFullItemByID(vf, vaultKey, id)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	if existing == nil {
 		fmt.Println("No credential found")
 		return
 	}
 
-	username, _ := utils.Prompt("New username: ")
-	pass, _ := utils.Prompt("New password: ")
-	notes, _ := utils.Prompt("New notes: ")
+	fmt.Println("Leave field blank to keep current value")
 
-	if ok := vault.UpdateItem(v, site, username, pass, notes); !ok {
+	username, _ := utils.Prompt(fmt.Sprintf("New username [%s]: ", existing.Username))
+	pass, _ := utils.Prompt("New password [hidden]: ")
+	notes, _ := utils.Prompt(fmt.Sprintf("New notes [%s]: ", existing.Notes))
+
+	if username == "" {
+		username = existing.Username
+	}
+	if pass == "" {
+		pass = existing.Password
+	}
+	if notes == "" {
+		notes = existing.Notes
+	}
+
+	ok, err := vault.UpdateItemByID(vf, vaultKey, id, username, pass, notes)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+	if !ok {
 		fmt.Println("Update failed")
 		return
 	}
 
-	if err := vault.SaveVault(vaultPath, v, vf, key); err != nil {
+	if err := vault.SaveVault(vaultPath, vf); err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
@@ -223,19 +283,20 @@ func handleDelete() {
 		return
 	}
 
-	v, vf, key, err := vault.LoadVault(vaultPath, password)
+	_, vf, err := vault.UnlockVault(vaultPath, password)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 
-	site, _ := utils.Prompt("Enter site to delete: ")
-	if ok := vault.DeleteItem(v, site); !ok {
-		fmt.Println("No credential found for site:", site)
+	id, _ := utils.Prompt("Enter credential ID to delete: ")
+
+	if ok := vault.DeleteItemByID(vf, id); !ok {
+		fmt.Println("No credential found for ID:", id)
 		return
 	}
 
-	if err := vault.SaveVault(vaultPath, v, vf, key); err != nil {
+	if err := vault.SaveVault(vaultPath, vf); err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
@@ -269,12 +330,6 @@ func handleChangeMasterPassword() {
 		return
 	}
 
-	v, _, _, err := vault.LoadVault(vaultPath, oldPassword)
-	if err != nil {
-		fmt.Println("Error:", err)
-		return
-	}
-
 	newPassword, err := utils.PromptPassword("Enter new master password: ")
 	if err != nil {
 		fmt.Println("Error:", err)
@@ -297,7 +352,7 @@ func handleChangeMasterPassword() {
 		return
 	}
 
-	if err := vault.ChangeMasterPassword(vaultPath, v, newPassword); err != nil {
+	if err := vault.ChangeMasterPassword(vaultPath, oldPassword, newPassword); err != nil {
 		fmt.Println("Error:", err)
 		return
 	}

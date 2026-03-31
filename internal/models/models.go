@@ -1,17 +1,25 @@
 package models
 
-type VaultFile struct {
-	Version           int    `json:"version"`
-	KDFSalt           string `json:"kdf_salt"`
-	KDFMemory         uint32 `json:"kdf_memory"`
-	KDFIterations     uint32 `json:"kdf_iterations"`
-	KDFParallelism    uint8  `json:"kdf_parallelism"`
-	EncryptionNonce   string `json:"encryption_nonce"`
-	EncryptedValutB64 string `json:"encrypted_vault_b64"`
+type KDFParams struct {
+	Salt        string `json:"salt"`
+	Memory      uint32 `json:"memory"`
+	Iterations  uint32 `json:"iterations"`
+	Parallelism uint8  `json:"parallelism"`
 }
 
-type Vault struct {
-	Items []VaultItem `json:"items"`
+type EncryptedItem struct {
+	ID         string `json:"id"`
+	Site       string `json:"site"`
+	Nonce      string `json:"nonce"`
+	Ciphertext string `json:"ciphertext"`
+}
+
+type VaultFile struct {
+	Version         int             `json:"version"`
+	KDF             KDFParams       `json:"kdf"`
+	WrappedVaultKey string          `json:"wrapped_vault_key"`
+	VaultKeyNonce   string          `json:"vault_key_nonce"`
+	Items           []EncryptedItem `json:"items"`
 }
 
 type VaultItem struct {
