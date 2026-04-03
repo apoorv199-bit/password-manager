@@ -6,6 +6,7 @@ import (
 	"password-manager-cli/internal/utils"
 	"password-manager-cli/internal/vault"
 	"strconv"
+	"time"
 )
 
 const vaultPath = "data/vault.json"
@@ -37,6 +38,8 @@ func main() {
 		handleGeneratePassword()
 	case "change-master-password":
 		handleChangeMasterPassword()
+	case "copy-password":
+		handleCopyPassword()
 	default:
 		fmt.Println("Unknown command:", command)
 		printUsage()
@@ -177,10 +180,14 @@ func handleGet() {
 	fmt.Println("\nCredential Details:")
 	fmt.Println("Site     :", item.Site)
 	fmt.Println("Username :", item.Username)
-	fmt.Println("Password :", item.Password)
 	fmt.Println("Notes    :", item.Notes)
 	fmt.Println("Created  :", item.CreatedAt)
 	fmt.Println("Updated  :", item.UpdatedAt)
+
+	reveal, _ := utils.Prompt("Reveal password? (y/N): ")
+	if reveal == "y" || reveal == "Y" {
+		fmt.Println("Password: ", item.Password)
+	}
 }
 
 func handleSearch() {
@@ -358,6 +365,51 @@ func handleChangeMasterPassword() {
 	}
 
 	fmt.Println("Master password changed successfully")
+}
+
+func handleCopyPassword() {
+	password, err := utils.PromptPassword("Enter master password: ")
+	if err != nil {
+		fmt.Println("Error: ", err)
+		return
+	}
+
+	vaultKey, vf, err := vault.UnlockVault(vaultPath, password)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	id, _ := utils.Prompt("Enter credential ID: ")
+	item, err := vault.GetFullItemByID(vf, vaultKey, id)
+	if err != nil {
+		fmt.Println("Error:", err)
+		return
+	}
+
+	if item == nil {
+		fmt.Println("No credential found")
+		return
+	}
+
+	timeoutStr, _ := utils.Prompt("Clear clipboard after (seconds, default 15): ")
+	timeout := 15
+	if timeoutStr != "" {
+		if parsed, err := strconv.Atoi(timeoutStr); err == nil && parsed > 0 {
+			timeout = parsed
+		}
+	}
+
+	err = utils.CopyToClipboard(item.Password, time.Duration(timeout)*time.Second)
+	if err != nil {
+		fmt.Println("Error copying to clipboard:", err)
+		return
+	}
+
+	fmt.Printf("Password copied for '%s' (%s). Clipboard will clear in %d seconds\n", item.Site, item.Username, timeout)
+
+	// Keep the main function alive until clipboard is cleared
+	time.Sleep(time.Duration(timeout+1) * time.Second)
 }
 
 func printUsage() {
